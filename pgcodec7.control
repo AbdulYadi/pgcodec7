@@ -1,0 +1,6 @@
+# pgsqlldap extension
+comment = 'pgcodec7'
+default_version = '1.0'
+module_pathname = '$libdir/pgcodec7'
+relocatable = true
+
