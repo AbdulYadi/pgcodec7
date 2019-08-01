@@ -9,13 +9,15 @@ PG_MODULE_MAGIC;
 #include <utils/builtins.h>
 #include <access/htup_details.h>
 
-#define PGENCODE7_ARGCOUNT 1
-#define PGENCODE7_ARGDATA 0
+#define PGENCODE7_ARGCOUNT 2
+#define PGENCODE7_ARGLEN 0
+#define PGENCODE7_ARGDATA 1
 PG_FUNCTION_INFO_V1(pgencode7);
 Datum pgencode7(PG_FUNCTION_ARGS);
 
-#define PGDECODE7_ARGCOUNT 1
-#define PGDECODE7_ARGTEXT 0
+#define PGDECODE7_ARGCOUNT 2
+#define PGDECODE7_ARGLEN 0
+#define PGDECODE7_ARGTEXT 1
 PG_FUNCTION_INFO_V1(pgdecode7);
 Datum pgdecode7(PG_FUNCTION_ARGS);
 
@@ -52,7 +54,7 @@ const unsigned char PGCODEC7_CARRYMASK[] = {
 	0B01111111
 };	
 
-const unsigned char PGCODEC7_BALANCEMASK[] = {
+const unsigned char PGCODEC7_BALANCEMASK7[] = {
 	0B00000000,
 	0B01000000,
 	0B01100000,
@@ -63,14 +65,24 @@ const unsigned char PGCODEC7_BALANCEMASK[] = {
 	0B11111111
 };
 
+const unsigned char PGCODEC7_BALANCEMASK6[] = {
+	0B00000000,
+	0B00100000,
+	0B00110000,
+	0B00111000,
+	0B00111100,
+	0B00111110,
+	0B00111111,
+	0B11111111
+};
+
 #define PGCODEC7_BUFFSIZE 1024
-#define PGCODEC7_BITLEN 7	
 
 typedef struct {
-	//unsigned char* data;
 	unsigned char* pData;
 	int32 len;
 	int32 maxEncodeStepByteCount;
+	int32 encodeLength;
 } Pgcodec7EncodeData;
 		
 Datum 
@@ -92,20 +104,27 @@ pgencode7(PG_FUNCTION_ARGS)
 			
 		if(PG_NARGS()!=PGENCODE7_ARGCOUNT)
 			elog(ERROR, "argument count must be %d", PGENCODE7_ARGCOUNT);			
-		
-		if(PG_ARGISNULL(PGENCODE7_ARGDATA))
-			elog(ERROR, "data must be defined");
-			
+
+		if(PG_ARGISNULL(PGENCODE7_ARGLEN))
+			elog(ERROR, "encoding length must be defined");
+
 		ped = (Pgcodec7EncodeData*)palloc(1*sizeof(Pgcodec7EncodeData));
 		funcctx->user_fctx = (void*)ped;
-
+		
+		ped->encodeLength = 	PG_GETARG_INT32(PGENCODE7_ARGLEN);
+		if( ped->encodeLength!=6 && ped->encodeLength!=7 )
+			elog(ERROR, "encode length must be 6 or 7");
+					
+		if(PG_ARGISNULL(PGENCODE7_ARGDATA))
+			elog(ERROR, "data must be defined");
+						
 		bytes = PG_GETARG_BYTEA_PP(PGENCODE7_ARGDATA);
 		ped->pData = (unsigned char*)VARDATA_ANY(bytes);
 		ped->len = VARSIZE_ANY_EXHDR(bytes);
 		
-		compressedByteCount = ((ped->len * 8) + (PGCODEC7_BITLEN-1) ) / PGCODEC7_BITLEN;
+		compressedByteCount = ((ped->len * 8) + (ped->encodeLength-1) ) / ped->encodeLength;
 		funcctx->max_calls = (compressedByteCount + (PGCODEC7_BUFFSIZE - 1))/PGCODEC7_BUFFSIZE;
-		ped->maxEncodeStepByteCount = ((PGCODEC7_BITLEN * PGCODEC7_BUFFSIZE) - (PGCODEC7_BITLEN-1)) / 8;
+		ped->maxEncodeStepByteCount = ((ped->encodeLength * PGCODEC7_BUFFSIZE) - (ped->encodeLength-1)) / 8;
 				
 		MemoryContextSwitchTo(oldcontext);
 	}//if (SRF_IS_FIRSTCALL())
@@ -120,7 +139,7 @@ pgencode7(PG_FUNCTION_ARGS)
 		carry = 0;
 		carryByte = 0B00000000;	
 		for(i=0; i<byteCount; i++) {
-			take = PGCODEC7_BITLEN - carry;
+			take = ped->encodeLength - carry;
 			mask = PGCODEC7_TAKEMASK[take];
 			shift = 8 - take;
 			byte = carryByte | ( (*(ped->pData) & mask) >> shift );
@@ -128,10 +147,10 @@ pgencode7(PG_FUNCTION_ARGS)
 			
 			carry = 8 - take;
 			mask = PGCODEC7_CARRYMASK[carry];
-			shift = PGCODEC7_BITLEN - carry;
+			shift = ped->encodeLength - carry;
 			carryByte = (*(ped->pData) & mask) << shift;			
 			
-			if(carry==PGCODEC7_BITLEN || (carry>0 && i==byteCount-1)) {
+			if(carry==ped->encodeLength || (carry>0 && i==byteCount-1)) {
 				*(pRun++) = PGCODEC7_MAP[carryByte];
 				carry = 0;
 				carryByte = 0B00000000;
@@ -155,19 +174,28 @@ pgdecode7(PG_FUNCTION_ARGS)
 {
 	ArrayType *arr;
 	Datum *dimdatums;
-	int32 ndim, i;
+	int32 ndim, i, decodeLength;
 	char *s;
 	unsigned char carry, carryByte, balance, byte, available, take, mask, shift;
+	const unsigned char *pBalanceMask;
 	
 	bytea* byteout;
 	StringInfoData bytedata;
 	
 	if(PG_NARGS()!=PGDECODE7_ARGCOUNT)
 		elog(ERROR, "argument count must be %d", PGDECODE7_ARGCOUNT);			
-			
+
+	if(PG_ARGISNULL(PGDECODE7_ARGLEN))
+		elog(ERROR, "decoding length must be defined");
+
+	decodeLength = 	PG_GETARG_INT32(PGDECODE7_ARGLEN);
+	if( decodeLength!=6 && decodeLength!=7 )
+		elog(ERROR, "decode length must be 6 or 7");		
+						
 	if(PG_ARGISNULL(PGDECODE7_ARGTEXT))
 		elog(ERROR, "text must be defined");
 	
+	pBalanceMask = decodeLength==7 ? PGCODEC7_BALANCEMASK7 : PGCODEC7_BALANCEMASK6;
 	initStringInfo(&bytedata);	
 	arr = PG_GETARG_ARRAYTYPE_P(PGDECODE7_ARGTEXT);
 	deconstruct_array(arr, TEXTOID, -1, false, 'i', &dimdatums, NULL, &ndim);
@@ -178,11 +206,11 @@ pgdecode7(PG_FUNCTION_ARGS)
 		balance = 8;	
 		while( (byte = *(s++)) ) {
 			byte = strchr(PGCODEC7_MAP, byte) - PGCODEC7_MAP;												
-			available = PGCODEC7_BITLEN;
+			available = decodeLength;
 			if( carry>0 ) {
 				take = 8 - carry;
-				mask = PGCODEC7_BALANCEMASK[take];
-				shift = PGCODEC7_BITLEN - take;
+				mask = pBalanceMask[take];
+				shift = decodeLength - take;
 				carryByte |= ((byte & mask) >> shift);
 				appendBinaryStringInfo(&bytedata, (const char*)&carryByte, 1);
 				balance = 8;
